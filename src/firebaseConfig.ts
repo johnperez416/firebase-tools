@@ -5,12 +5,21 @@
 // 'npm run generate:json-schema' to regenerate the schema files.
 //
 
-import { RequireAtLeastOne } from "./metaprogramming";
+import type { HttpsOptions } from "firebase-functions/v2/https";
+import { IngressSetting, MemoryOption, VpcEgressSetting } from "firebase-functions/v2/options";
+import { Runtime, DecommissionedRuntime } from "./deploy/functions/runtimes/supported/types";
 
-// should be sourced from - https://github.com/firebase/firebase-tools/blob/master/src/deploy/functions/runtimes/index.ts#L15
-type CloudFunctionRuntimes = "nodejs10" | "nodejs12" | "nodejs14" | "nodejs16";
+/**
+ * Creates a type that requires at least one key to be present in an interface
+ * type. For example, RequireAtLeastOne<{ foo: string; bar: string }> can hold
+ * a value of { foo: "a" }, { bar: "b" }, or { foo: "a", bar: "b" } but not {}
+ * Sourced from - https://docs.microsoft.com/en-us/javascript/api/@azure/keyvault-certificates/requireatleastone?view=azure-node-latest
+ */
+export type RequireAtLeastOne<T> = {
+  [K in keyof T]-?: Required<Pick<T, K>> & Partial<Pick<T, Exclude<keyof T, K>>>;
+}[keyof T];
 
-type Deployable = {
+export type Deployable = {
   predeploy?: string | string[];
   postdeploy?: string | string[];
 };
@@ -27,9 +36,24 @@ type DatabaseMultiple = ({
 }> &
   Deployable)[];
 
+type FirestoreSingle = {
+  database?: string;
+  rules?: string;
+  indexes?: string;
+} & Deployable;
+
+type FirestoreMultiple = ({
+  rules?: string;
+  indexes?: string;
+} & RequireAtLeastOne<{
+  database: string;
+  target: string;
+}> &
+  Deployable)[];
+
 export type HostingSource = { glob: string } | { source: string } | { regex: string };
 
-type HostingRedirects = HostingSource & {
+export type HostingRedirects = HostingSource & {
   destination: string;
   type?: number;
 };
@@ -67,7 +91,29 @@ export type HostingHeaders = HostingSource & {
   }[];
 };
 
-type HostingBase = {
+// Allow only serializable options, since this is in firebase.json
+// TODO(jamesdaniels) look into allowing serialized CEL expressions, params, and regexp
+//                    and if we can build this interface automatically via Typescript silliness
+interface FrameworksBackendOptions extends HttpsOptions {
+  omit?: boolean;
+  cors?: string | boolean;
+  memory?: MemoryOption;
+  timeoutSeconds?: number;
+  minInstances?: number;
+  maxInstances?: number;
+  concurrency?: number;
+  vpcConnector?: string;
+  vpcConnectorEgressSettings?: VpcEgressSetting;
+  serviceAccount?: string;
+  ingressSettings?: IngressSetting;
+  secrets?: string[];
+  // Only allow a single region to be specified
+  region?: string;
+  // Invoker can only be public
+  invoker?: "public";
+}
+
+export type HostingBase = {
   public?: string;
   source?: string;
   ignore?: string[];
@@ -80,6 +126,7 @@ type HostingBase = {
   i18n?: {
     root: string;
   };
+  frameworksBackend?: FrameworksBackendOptions;
 };
 
 export type HostingSingle = HostingBase & {
@@ -101,13 +148,6 @@ export type HostingMultiple = (HostingBase &
   }> &
   Deployable)[];
 
-// After validating a HostingMultiple and resolving targets, we will instead
-// have a HostingResolved.
-export type HostingResolved = HostingBase & {
-  site: string;
-  target?: string;
-} & Deployable;
-
 type StorageSingle = {
   rules: string;
   target?: string;
@@ -122,15 +162,12 @@ type StorageMultiple = ({
 // Full Configs
 export type DatabaseConfig = DatabaseSingle | DatabaseMultiple;
 
-export type FirestoreConfig = {
-  rules?: string;
-  indexes?: string;
-} & Deployable;
+export type FirestoreConfig = FirestoreSingle | FirestoreMultiple;
 
 export type FunctionConfig = {
   source?: string;
   ignore?: string[];
-  runtime?: CloudFunctionRuntimes;
+  runtime?: Exclude<Runtime, DecommissionedRuntime>;
   codebase?: string;
 } & Deployable;
 
@@ -166,6 +203,16 @@ export type EmulatorsConfig = {
     host?: string;
     port?: number;
   };
+  apphosting?: {
+    host?: string;
+    port?: number;
+    startCommand?: string;
+    /**
+     * @deprecated
+     */
+    startCommandOverride?: string;
+    rootDirectory?: string;
+  };
   pubsub?: {
     host?: string;
     port?: number;
@@ -193,11 +240,35 @@ export type EmulatorsConfig = {
     port?: number;
   };
   singleProjectMode?: boolean;
+  dataconnect?: {
+    host?: string;
+    port?: number;
+    postgresHost?: string;
+    postgresPort?: number;
+    dataDir?: string;
+  };
+  tasks?: {
+    host?: string;
+    port?: number;
+  };
 };
 
 export type ExtensionsConfig = Record<string, string>;
 
+export type DataConnectSingle = {
+  // The directory containing dataconnect.yaml for this service
+  source: string;
+} & Deployable;
+
+export type DataConnectMultiple = DataConnectSingle[];
+
+export type DataConnectConfig = DataConnectSingle | DataConnectMultiple;
+
 export type FirebaseConfig = {
+  /**
+   * @TJS-format uri
+   */
+  $schema?: string;
   database?: DatabaseConfig;
   firestore?: FirestoreConfig;
   functions?: FunctionsConfig;
@@ -206,4 +277,5 @@ export type FirebaseConfig = {
   remoteconfig?: RemoteConfigConfig;
   emulators?: EmulatorsConfig;
   extensions?: ExtensionsConfig;
+  dataconnect?: DataConnectConfig;
 };

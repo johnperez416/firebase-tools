@@ -4,6 +4,7 @@ import * as admin from "firebase-admin";
 import * as fs from "fs";
 import * as supertest from "supertest";
 import { EmulatorEndToEndTest } from "../../integration-helpers/framework";
+import { gunzipSync } from "zlib";
 import { TEST_ENV } from "./env";
 import {
   EMULATORS_SHUTDOWN_DELAY_MS,
@@ -98,7 +99,7 @@ describe("GCS endpoint conformance tests", () => {
         .then((res) => res);
 
       expect(res.header["content-type"]).to.be.eql("application/octet-stream");
-      expect(res.header["content-disposition"]).to.be.eql("attachment");
+      expect(res.header["content-disposition"]).to.be.eql("attachment; filename*=testFile");
     });
   });
 
@@ -138,10 +139,10 @@ describe("GCS endpoint conformance tests", () => {
       expect(metadata.kind).to.be.eql("storage#object");
       expect(metadata.id).to.be.include(`${storageBucket}/${TEST_FILE_NAME}`);
       expect(metadata.selfLink).to.be.eql(
-        `${googleapisHost}/storage/v1/b/${storageBucket}/o/${ENCODED_TEST_FILE_NAME}`
+        `${googleapisHost}/storage/v1/b/${storageBucket}/o/${ENCODED_TEST_FILE_NAME}`,
       );
       expect(metadata.mediaLink).to.include(
-        `${storageHost}/download/storage/v1/b/${storageBucket}/o/${ENCODED_TEST_FILE_NAME}`
+        `${storageHost}/download/storage/v1/b/${storageBucket}/o/${ENCODED_TEST_FILE_NAME}`,
       );
       expect(metadata.mediaLink).to.include(`alt=media`);
       expect(metadata.name).to.be.eql(TEST_FILE_NAME);
@@ -182,7 +183,7 @@ describe("GCS endpoint conformance tests", () => {
       emulatorOnly.it("should handle resumable uploads", async () => {
         const uploadURL = await supertest(storageHost)
           .post(
-            `/upload/storage/v1/b/${storageBucket}/o?name=${TEST_FILE_NAME}&uploadType=resumable`
+            `/upload/storage/v1/b/${storageBucket}/o?name=${TEST_FILE_NAME}&uploadType=resumable`,
           )
           .set(authHeader)
           .expect(200)
@@ -234,7 +235,7 @@ describe("GCS endpoint conformance tests", () => {
 
         const uploadURL = await supertest(storageHost)
           .post(
-            `/upload/storage/v1/b/${storageBucket}/o?name=${TEST_FILE_NAME}&uploadType=resumable`
+            `/upload/storage/v1/b/${storageBucket}/o?name=${TEST_FILE_NAME}&uploadType=resumable`,
           )
           .set(authHeader)
           .send(customMetadata)
@@ -249,6 +250,26 @@ describe("GCS endpoint conformance tests", () => {
         expect(returnedMetadata.name).to.equal(customMetadata.name);
         expect(returnedMetadata.contentType).to.equal(customMetadata.contentType);
         expect(returnedMetadata.contentDisposition).to.equal(customMetadata.contentDisposition);
+      });
+
+      it("should upload content type properly from x-upload-content-type headers", async () => {
+        const uploadURL = await supertest(storageHost)
+          .post(
+            `/upload/storage/v1/b/${storageBucket}/o?name=${TEST_FILE_NAME}&uploadType=resumable`,
+          )
+          .set(authHeader)
+          .set({
+            "x-upload-content-type": "image/png",
+          })
+          .expect(200)
+          .then((res) => new URL(res.header["location"]));
+
+        const returnedMetadata = await supertest(storageHost)
+          .put(uploadURL.pathname + uploadURL.search)
+          .expect(200)
+          .then((res) => res.body);
+
+        expect(returnedMetadata.contentType).to.equal("image/png");
       });
     });
 
@@ -290,6 +311,120 @@ describe("GCS endpoint conformance tests", () => {
           .expect(400);
 
         expect(res.text).to.include("Bad content type.");
+      });
+
+      it("should upload content type properly from x-upload headers", async () => {
+        const returnedMetadata = await supertest(storageHost)
+          .post(`/upload/storage/v1/b/${storageBucket}/o?uploadType=multipart`)
+          .set(authHeader)
+          .set({
+            "content-type": "multipart/related; boundary=b1d5b2e3-1845-4338-9400-6ac07ce53c1e",
+          })
+          .set({
+            "x-upload-content-type": "text/plain",
+          })
+          .send(MULTIPART_REQUEST_BODY)
+          .expect(200)
+          .then((res) => res.body);
+
+        expect(returnedMetadata.contentType).to.equal("text/plain");
+      });
+    });
+  });
+
+  describe("Gzip", () => {
+    it("should serve gunzipped file by default", async () => {
+      const contents = Buffer.from("hello world");
+      const fileName = "gzippedFile";
+      const file = testBucket.file(fileName);
+      await file.save(contents, {
+        gzip: true,
+        contentType: "text/plain",
+      });
+
+      // Use requestClient since supertest will decompress the response body by default.
+      await new Promise((resolve, reject) => {
+        TEST_ENV.requestClient.get(
+          `${storageHost}/download/storage/v1/b/${storageBucket}/o/${fileName}?alt=media`,
+          { headers: { ...authHeader } },
+          (res) => {
+            expect(res.headers["content-encoding"]).to.be.undefined;
+            expect(res.headers["content-length"]).to.be.undefined;
+            expect(res.headers["content-type"]).to.be.eql("text/plain");
+
+            let responseBody = Buffer.alloc(0);
+            res
+              .on("data", (chunk) => {
+                responseBody = Buffer.concat([responseBody, chunk]);
+              })
+              .on("end", () => {
+                expect(responseBody).to.be.eql(contents);
+              })
+              .on("close", resolve)
+              .on("error", reject);
+          },
+        );
+      });
+    });
+
+    it("should serve gzipped file if Accept-Encoding header allows", async () => {
+      const contents = Buffer.from("hello world");
+      const fileName = "gzippedFile";
+      const file = testBucket.file(fileName);
+      await file.save(contents, {
+        gzip: true,
+        contentType: "text/plain",
+      });
+
+      // Use requestClient since supertest will decompress the response body by default.
+      await new Promise((resolve, reject) => {
+        TEST_ENV.requestClient.get(
+          `${storageHost}/download/storage/v1/b/${storageBucket}/o/${fileName}?alt=media`,
+          { headers: { ...authHeader, "Accept-Encoding": "gzip" } },
+          (res) => {
+            expect(res.headers["content-encoding"]).to.be.eql("gzip");
+            expect(res.headers["content-type"]).to.be.eql("text/plain");
+
+            let responseBody = Buffer.alloc(0);
+            res
+              .on("data", (chunk) => {
+                responseBody = Buffer.concat([responseBody, chunk]);
+              })
+              .on("end", () => {
+                expect(responseBody).to.not.be.eql(contents);
+                const decompressed = gunzipSync(responseBody);
+                expect(decompressed).to.be.eql(contents);
+              })
+              .on("close", resolve)
+              .on("error", reject);
+          },
+        );
+      });
+    });
+  });
+
+  describe("List protocols", () => {
+    describe("list objects", () => {
+      // This test is for the '/storage/v1/b/:bucketId/o' url pattern, which is used specifically by the GO Admin SDK
+      it("should list objects in the provided bucket", async () => {
+        await supertest(storageHost)
+          .post(`/upload/storage/v1/b/${storageBucket}/o?name=${TEST_FILE_NAME}`)
+          .set(authHeader)
+          .send(Buffer.from("hello world"))
+          .expect(200);
+
+        await supertest(storageHost)
+          .post(`/upload/storage/v1/b/${storageBucket}/o?name=${TEST_FILE_NAME}2`)
+          .set(authHeader)
+          .send(Buffer.from("hello world"))
+          .expect(200);
+
+        const data = await supertest(storageHost)
+          .get(`/storage/v1/b/${storageBucket}/o`)
+          .set(authHeader)
+          .expect(200)
+          .then((res) => res.body);
+        expect(data.items.length).to.equal(2);
       });
     });
   });
