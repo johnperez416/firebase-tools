@@ -1,7 +1,7 @@
 import { expect } from "chai";
 import * as admin from "firebase-admin";
 import * as fs from "fs";
-import * as rimraf from "rimraf";
+import { rmSync } from "node:fs";
 import * as path from "path";
 
 import { FrameworkOptions, TriggerEndToEndTest } from "../integration-helpers/framework";
@@ -30,7 +30,7 @@ function cleanUpExtensionsCache(): void {
     process.env.FIREBASE_EXTENSIONS_CACHE_PATH &&
     fs.existsSync(process.env.FIREBASE_EXTENSIONS_CACHE_PATH)
   ) {
-    rimraf.sync(process.env.FIREBASE_EXTENSIONS_CACHE_PATH);
+    rmSync(process.env.FIREBASE_EXTENSIONS_CACHE_PATH, { recursive: true });
   }
 }
 
@@ -51,7 +51,7 @@ describe("CF3 and Extensions emulator", () => {
 
     const config = readConfig();
     const storagePort = config.emulators!.storage.port;
-    process.env.STORAGE_EMULATOR_HOST = `http://localhost:${storagePort}`;
+    process.env.STORAGE_EMULATOR_HOST = `http://127.0.0.1:${storagePort}`;
 
     const firestorePort = config.emulators!.firestore.port;
     process.env.FIRESTORE_EMULATOR_HOST = `localhost:${firestorePort}`;

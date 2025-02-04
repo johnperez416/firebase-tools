@@ -1,6 +1,7 @@
 import * as build from "../../build";
+import * as backend from "../../backend";
 import * as params from "../../params";
-import * as runtimes from "..";
+import { Runtime } from "../supported";
 
 import { copyIfPresent, convertIfPresent, secondsFromDuration } from "../../../../gcp/proto";
 import { assertKeyTypes, requireKeys } from "./parsing";
@@ -13,7 +14,7 @@ const CHANNEL_NAME_REGEX = new RegExp(
     "locations\\/" +
     "(?<location>[A-Za-z\\d\\-_]+)\\/" +
     "channels\\/" +
-    "(?<channel>[A-Za-z\\d\\-_]+)"
+    "(?<channel>[A-Za-z\\d\\-_]+)",
 );
 
 export interface ManifestSecretEnv {
@@ -44,6 +45,7 @@ export type WireEndpoint = build.Triggered &
   Partial<build.TaskQueueTriggered> &
   Partial<build.BlockingTriggered> &
   Partial<{ scheduleTrigger: WireScheduleTrigger }> & {
+    omit?: build.Field<boolean>;
     labels?: Record<string, string> | null;
     environmentVariables?: Record<string, string> | null;
     availableMemoryMb?: build.MemoryOption | build.Expression<number> | null;
@@ -60,20 +62,28 @@ export type WireEndpoint = build.Triggered &
     serviceAccount?: string | null;
     // Note: Historically we used "serviceAccountEmail" to refer to a thing that
     // might not be an email (e.g. it might be "myAccount@"" to be project-relative)
-    // We now use "serviceAccount" but maintain backwards compatability in the
+    // We now use "serviceAccount" but maintain backwards compatibility in the
     // wire format for the time being.
     serviceAccountEmail?: string | null;
-    region?: string[];
+    region?: build.ListField;
     entryPoint: string;
     platform?: build.FunctionsPlatform;
     secretEnvironmentVariables?: Array<ManifestSecretEnv> | null;
   };
+
+export type WireExtension = {
+  params: Record<string, string>;
+  ref?: string;
+  localPath?: string;
+  events: string[];
+};
 
 export interface WireManifest {
   specVersion: string;
   params?: params.Param[];
   requiredAPIs?: build.RequiredApi[];
   endpoints: Record<string, WireEndpoint>;
+  extensions?: Record<string, WireExtension>;
 }
 
 /** Returns a Build from a v1alpha1 Manifest. */
@@ -81,7 +91,7 @@ export function buildFromV1Alpha1(
   yaml: unknown,
   project: string,
   region: string,
-  runtime: runtimes.Runtime
+  runtime: Runtime,
 ): build.Build {
   const manifest = JSON.parse(JSON.stringify(yaml)) as WireManifest;
   requireKeys("", manifest, "endpoints");
@@ -90,6 +100,7 @@ export function buildFromV1Alpha1(
     params: "array",
     requiredAPIs: "array",
     endpoints: "object",
+    extensions: "object",
   });
   const bd: build.Build = build.empty();
   bd.params = manifest.params || [];
@@ -99,6 +110,15 @@ export function buildFromV1Alpha1(
     assertBuildEndpoint(me, id);
     const be: build.Endpoint = parseEndpointForBuild(id, me, project, region, runtime);
     bd.endpoints[id] = be;
+  }
+  if (manifest.extensions) {
+    bd.extensions = {};
+    for (const id of Object.keys(manifest.extensions)) {
+      const me: WireExtension = manifest.extensions[id];
+      assertBuildExtension(me, id);
+      const be: build.DynamicExtension = parseExtensionForBuild(me);
+      bd.extensions[id] = be;
+    }
   }
   return bd;
 }
@@ -111,7 +131,7 @@ function parseRequiredAPIs(manifest: WireManifest): build.RequiredApi[] {
     }
     if (typeof reason !== "string") {
       throw new FirebaseError(
-        `Invalid reason "${JSON.stringify(reason)} for API ${api}. Expected string`
+        `Invalid reason "${JSON.stringify(reason)} for API ${api}. Expected string`,
       );
     }
   }
@@ -121,10 +141,11 @@ function parseRequiredAPIs(manifest: WireManifest): build.RequiredApi[] {
 function assertBuildEndpoint(ep: WireEndpoint, id: string): void {
   const prefix = `endpoints[${id}]`;
   assertKeyTypes(prefix, ep, {
-    region: "array",
+    region: "List",
     platform: (platform) => build.AllFunctionsPlatforms.includes(platform),
     entryPoint: "string",
-    availableMemoryMb: (mem) => mem === null || isCEL(mem) || build.isValidMemoryOption(mem),
+    omit: "Field<boolean>?",
+    availableMemoryMb: (mem) => mem === null || isCEL(mem) || backend.isValidMemoryOption(mem),
     maxInstances: "Field<number>?",
     minInstances: "Field<number>?",
     concurrency: "Field<number>?",
@@ -193,7 +214,9 @@ function assertBuildEndpoint(ep: WireEndpoint, id: string): void {
       invoker: "array?",
     });
   } else if (build.isCallableTriggered(ep)) {
-    // no-op
+    assertKeyTypes(prefix + ".callableTrigger", ep.callableTrigger, {
+      genkitAction: "string?",
+    });
   } else if (build.isScheduleTriggered(ep)) {
     assertKeyTypes(prefix + ".scheduleTrigger", ep.scheduleTrigger, {
       schedule: "Field<string>",
@@ -207,7 +230,7 @@ function assertBuildEndpoint(ep: WireEndpoint, id: string): void {
         minBackoffSeconds: "Field<number>?",
         maxBackoffSeconds: "Field<number>?",
         maxRetrySeconds: "Field<number>?",
-        // The "duration" key types are supported for legacy compability reasons only.
+        // The "duration" key types are supported for legacy compatibility reasons only.
         // They are not parametized and are automatically converted by the parser to seconds.
         maxRetryDuration: "string?",
         minBackoffDuration: "string?",
@@ -242,9 +265,10 @@ function assertBuildEndpoint(ep: WireEndpoint, id: string): void {
       options: "object",
     });
   } else {
+    // TODO: Replace with assertExhaustive, which needs some type magic here because we have an any
     throw new FirebaseError(
       `Do not recognize trigger type for endpoint ${id}. Try upgrading ` +
-        "firebase-tools with npm install -g firebase-tools@latest"
+        "firebase-tools with npm install -g firebase-tools@latest",
     );
   }
 }
@@ -254,7 +278,7 @@ function parseEndpointForBuild(
   ep: WireEndpoint,
   project: string,
   defaultRegion: string,
-  runtime: runtimes.Runtime
+  runtime: Runtime,
 ): build.Endpoint {
   let triggered: build.Triggered;
   if (build.isEventTriggered(ep)) {
@@ -271,10 +295,10 @@ function parseEndpointForBuild(
       ep.eventTrigger,
       "serviceAccount",
       "eventFilterPathPatterns",
-      "region"
+      "region",
     );
     convertIfPresent(eventTrigger, ep.eventTrigger, "channel", (c) =>
-      resolveChannelName(project, c, defaultRegion)
+      resolveChannelName(project, c, defaultRegion),
     );
     convertIfPresent(eventTrigger, ep.eventTrigger, "eventFilters", (filters) => {
       const copy = { ...filters };
@@ -289,6 +313,7 @@ function parseEndpointForBuild(
     copyIfPresent(triggered.httpsTrigger, ep.httpsTrigger, "invoker");
   } else if (build.isCallableTriggered(ep)) {
     triggered = { callableTrigger: {} };
+    copyIfPresent(triggered.callableTrigger, ep.callableTrigger, "genkitAction");
   } else if (build.isScheduleTriggered(ep)) {
     const st: build.ScheduleTrigger = {
       // TODO: consider adding validation for fields like this that reject
@@ -303,21 +328,21 @@ function parseEndpointForBuild(
         ep.scheduleTrigger.retryConfig,
         "maxBackoffSeconds",
         "maxBackoffDuration",
-        (duration) => (duration === null ? null : secondsFromDuration(duration))
+        (duration) => (duration === null ? null : secondsFromDuration(duration)),
       );
       convertIfPresent(
         st.retryConfig,
         ep.scheduleTrigger.retryConfig,
         "minBackoffSeconds",
         "minBackoffDuration",
-        (duration) => (duration === null ? null : secondsFromDuration(duration))
+        (duration) => (duration === null ? null : secondsFromDuration(duration)),
       );
       convertIfPresent(
         st.retryConfig,
         ep.scheduleTrigger.retryConfig,
         "maxRetrySeconds",
         "maxRetryDuration",
-        (duration) => (duration === null ? null : secondsFromDuration(duration))
+        (duration) => (duration === null ? null : secondsFromDuration(duration)),
       );
       copyIfPresent(
         st.retryConfig,
@@ -326,28 +351,28 @@ function parseEndpointForBuild(
         "minBackoffSeconds",
         "maxBackoffSeconds",
         "maxRetrySeconds",
-        "maxDoublings"
+        "maxDoublings",
       );
       convertIfPresent(
         st.retryConfig,
         ep.scheduleTrigger.retryConfig,
         "minBackoffSeconds",
         "minBackoffDuration",
-        nullsafeVisitor(secondsFromDuration)
+        nullsafeVisitor(secondsFromDuration),
       );
       convertIfPresent(
         st.retryConfig,
         ep.scheduleTrigger.retryConfig,
         "maxBackoffSeconds",
         "maxBackoffDuration",
-        nullsafeVisitor(secondsFromDuration)
+        nullsafeVisitor(secondsFromDuration),
       );
       convertIfPresent(
         st.retryConfig,
         ep.scheduleTrigger.retryConfig,
         "maxRetrySeconds",
         "maxRetryDuration",
-        nullsafeVisitor(secondsFromDuration)
+        nullsafeVisitor(secondsFromDuration),
       );
     } else if (ep.scheduleTrigger.retryConfig === null) {
       st.retryConfig = null;
@@ -376,7 +401,7 @@ function parseEndpointForBuild(
   } else {
     throw new FirebaseError(
       `Do not recognize trigger type for endpoint ${id}. Try upgrading ` +
-        "firebase-tools with npm install -g firebase-tools@latest"
+        "firebase-tools with npm install -g firebase-tools@latest",
     );
   }
 
@@ -395,6 +420,7 @@ function parseEndpointForBuild(
   copyIfPresent(
     parsed,
     ep,
+    "omit",
     "availableMemoryMb",
     "cpu",
     "maxInstances",
@@ -405,7 +431,7 @@ function parseEndpointForBuild(
     "labels",
     "ingressSettings",
     "environmentVariables",
-    "serviceAccount"
+    "serviceAccount",
   );
   convertIfPresent(parsed, ep, "secretEnvironmentVariables", (senvs) => {
     if (!senvs) {
@@ -415,6 +441,49 @@ function parseEndpointForBuild(
       return { key, secret: secret || key, projectId: project } as build.SecretEnvVar;
     });
   });
+  return parsed;
+}
+
+function assertBuildExtension(ex: WireExtension, id: string): void {
+  const prefix = `extensions[${id}]`;
+  assertKeyTypes(prefix, ex, {
+    params: "object",
+    ref: "string?",
+    localPath: "string?",
+    events: "array",
+  });
+
+  let refOrPath = 0;
+  if (ex.ref) {
+    refOrPath++;
+  }
+  if (ex.localPath) {
+    refOrPath++;
+  }
+  if (refOrPath === 0) {
+    throw new FirebaseError(
+      `Expected either extension reference or local path in extension: ${id}`,
+    );
+  }
+  if (refOrPath > 1) {
+    throw new FirebaseError(
+      `Multiple definitions for extension ${id}. Do not specify both reference and local path.`,
+    );
+  }
+}
+
+function parseExtensionForBuild(ex: WireExtension): build.DynamicExtension {
+  const parsed: build.DynamicExtension = {
+    params: {},
+    events: [],
+  };
+  if (ex.localPath) {
+    parsed.localPath = ex.localPath;
+  } else {
+    parsed.ref = ex.ref;
+  }
+  copyIfPresent(parsed, ex, "params", "events");
+
   return parsed;
 }
 
