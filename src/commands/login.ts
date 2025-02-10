@@ -1,4 +1,3 @@
-import * as _ from "lodash";
 import * as clc from "colorette";
 
 import { Command } from "../command";
@@ -10,6 +9,7 @@ import { promptOnce } from "../prompt";
 
 import * as auth from "../auth";
 import { isCloudEnvironment } from "../utils";
+import { User, Tokens } from "../types/auth";
 
 export const command = new Command("login")
   .description("log the CLI into Firebase")
@@ -21,12 +21,12 @@ export const command = new Command("login")
         "Cannot run login in non-interactive mode. See " +
           clc.bold("login:ci") +
           " to generate a token for use in non-interactive environments.",
-        { exit: 1 }
+        { exit: 1 },
       );
     }
 
-    const user = options.user as auth.User | undefined;
-    const tokens = options.tokens as auth.Tokens | undefined;
+    const user = options.user as User | undefined;
+    const tokens = options.tokens as Tokens | undefined;
 
     if (user && tokens && !options.reauth) {
       logger.info("Already logged in as", clc.bold(user.email));
@@ -35,7 +35,7 @@ export const command = new Command("login")
 
     if (!options.reauth) {
       utils.logBullet(
-        "Firebase optionally collects CLI and Emulator Suite usage and error reporting information to help improve our products. Data is collected in accordance with Google's privacy policy (https://policies.google.com/privacy) and is not used to identify you.\n"
+        "Firebase optionally collects CLI and Emulator Suite usage and error reporting information to help improve our products. Data is collected in accordance with Google's privacy policy (https://policies.google.com/privacy) and is not used to identify you.\n",
       );
       const collectUsage = await promptOnce({
         type: "confirm",
@@ -46,7 +46,7 @@ export const command = new Command("login")
       configstore.set("usage", collectUsage);
       if (collectUsage) {
         utils.logBullet(
-          "To change your data collection preference at any time, run `firebase logout` and log in again."
+          "To change your data collection preference at any time, run `firebase logout` and log in again.",
         );
       }
     }
@@ -56,7 +56,7 @@ export const command = new Command("login")
     // the authorization callback couldn't redirect to localhost.
     const useLocalhost = isCloudEnvironment() ? false : options.localhost;
 
-    const result = await auth.loginGoogle(useLocalhost, _.get(user, "email"));
+    const result = await auth.loginGoogle(useLocalhost, user?.email);
     configstore.set("user", result.user);
     configstore.set("tokens", result.tokens);
     // store login scopes in case mandatory scopes grow over time
@@ -71,7 +71,7 @@ export const command = new Command("login")
       // Shouldn't really happen, but the JWT library that parses our results may
       // return a string
       logger.debug(
-        "Unexpected string for UserCredentials.user. Maybe an auth response JWT didn't parse right?"
+        "Unexpected string for UserCredentials.user. Maybe an auth response JWT didn't parse right?",
       );
       utils.logSuccess("Success! Logged in");
     }
