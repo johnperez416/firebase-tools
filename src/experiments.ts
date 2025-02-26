@@ -1,8 +1,9 @@
-import { bold } from "colorette";
+import { bold, italic } from "colorette";
 import * as leven from "leven";
-
+import { basename } from "path";
 import { configstore } from "./configstore";
 import { FirebaseError } from "./error";
+import { isRunningInGithubAction } from "./init/features/hosting/github";
 
 export interface Experiment {
   shortDescription: string;
@@ -30,27 +31,19 @@ export const ALL_EXPERIMENTS = experiments({
   rtdbmanagement: {
     shortDescription: "Use new endpoint to administer realtime database instances",
   },
-
-  // Extensions experiments
-  ext: {
-    shortDescription: `Enables the ${bold("ext:sources:create")} command`,
-  },
-  extdev: {
-    shortDescription: `Enables the ${bold("ext:dev")} family of commands`,
-    docsUri: "https://firebase.google.com/docs/extensions/alpha/overview-build-extensions",
-  },
-
   // Cloud Functions for Firebase experiments
-  pythonfunctions: {
-    shortDescription: "Python support for Cloud Functions for Firebase",
+  functionsv2deployoptimizations: {
+    shortDescription: "Optimize deployments of v2 firebase functions",
     fullDescription:
-      "Adds the ability to initializea and deploy Cloud " +
-      "Functions for Firebase in Python. While this feature is experimental " +
-      "breaking API changes are allowed in MINOR API revisions",
+      "Reuse build images across funtions to increase performance and reliaibility " +
+      "of deploys. This has been made an experiment due to backend bugs that are " +
+      "temporarily causing failures in some regions with this optimization enabled",
+    public: true,
+    default: true,
   },
   deletegcfartifacts: {
     shortDescription: `Add the ${bold(
-      "functions:deletegcfartifacts"
+      "functions:deletegcfartifacts",
     )} command to purge docker build images`,
     fullDescription:
       `Add the ${bold("functions:deletegcfartifacts")}` +
@@ -64,16 +57,29 @@ export const ALL_EXPERIMENTS = experiments({
       "of how that image was created.",
     public: true,
   },
-  functionsparams: {
-    shortDescription: "Adds support for paramaterizing functions deployments",
-  },
-  skipdeployingnoopfunctions: {
-    shortDescription: "Detect that there have been no changes to a function and skip deployment",
+
+  // permanent experiment
+  automaticallydeletegcfartifacts: {
+    shortDescription: "Control whether functions cleans up images after deploys",
+    fullDescription:
+      "To control costs, Firebase defaults to automatically deleting containers " +
+      "created during the build process. This has the side-effect of preventing " +
+      "users from rolling back to previous revisions using the Run API. To change " +
+      `this behavior, call ${bold("experiments:disable deletegcfartifactsondeploy")} ` +
+      `consider also calling ${bold("experiments:enable deletegcfartifacts")} ` +
+      `to enable the new command ${bold("functions:deletegcfartifacts")} which` +
+      "lets you clean up images manually",
+    public: true,
+    default: true,
   },
 
   // Emulator experiments
   emulatoruisnapshot: {
     shortDescription: "Load pre-release versions of the emulator UI",
+  },
+  emulatorapphosting: {
+    shortDescription: "App Hosting emulator",
+    public: false,
   },
 
   // Hosting experiments
@@ -81,10 +87,11 @@ export const ALL_EXPERIMENTS = experiments({
     shortDescription: "Native support for popular web frameworks",
     fullDescription:
       "Adds support for popular web frameworks such as Next.js " +
-      "Nuxt, Netlify, Angular, and Vite-compatible frameworks. Firebase is " +
-      "committed to support these platforms long-term, but a manual migration " +
+      "Angular, React, Svelte, and Vite-compatible frameworks. A manual migration " +
       "may be required when the non-experimental support for these frameworks " +
       "is released",
+    docsUri: "https://firebase.google.com/docs/hosting/frameworks-overview",
+    public: true,
   },
   pintags: {
     shortDescription: "Adds the pinTag option to Run and Functions rewrites",
@@ -96,11 +103,53 @@ export const ALL_EXPERIMENTS = experiments({
       "exist per region. firebase-tools aggressively garbage collects tags it creates " +
       "if any service exceeds 500 tags, but it is theoretically possible that a project " +
       "exceeds the region-wide limit of tags and an old site version fails",
+    public: true,
+    default: true,
   },
-
   // Access experiments
   crossservicerules: {
     shortDescription: "Allow Firebase Rules to reference resources in other services",
+  },
+  internaltesting: {
+    shortDescription: "Exposes Firebase CLI commands intended for internal testing purposes.",
+    fullDescription:
+      "Exposes Firebase CLI commands intended for internal testing purposes. " +
+      "These commands are not meant for public consumption and may break or disappear " +
+      "without a notice.",
+  },
+
+  apphosting: {
+    shortDescription: "Allow CLI option for Frameworks",
+    default: true,
+    public: false,
+  },
+
+  // TODO(joehanley): Delete this once weve scrubbed all references to experiment from docs.
+  dataconnect: {
+    shortDescription: "Deprecated. Previosuly, enabled Data Connect related features.",
+    fullDescription: "Deprecated. Previously, enabled Data Connect related features.",
+    public: false,
+  },
+
+  genkit: {
+    shortDescription: "Enable Genkit related features.",
+    fullDescription: "Enable Genkit related features.",
+    default: true,
+    public: false,
+  },
+  appsinit: {
+    shortDescription: "Adds experimental `apps:init` command.",
+    fullDescription:
+      "Adds experimental `apps:init` command. When run from an app directory, this command detects the app's platform and configures required files.",
+    default: false,
+    public: true,
+  },
+
+  fdcconnectorevolution: {
+    shortDescription: "Enable Data Connect connector evolution warnings.",
+    fullDescription: "Enable Data Connect connector evolution warnings.",
+    default: false,
+    public: false,
   },
 });
 
@@ -121,7 +170,7 @@ export function experimentNameAutocorrect(malformed: string): string[] {
   if (isValidExperiment(malformed)) {
     throw new FirebaseError(
       "Assertion failed: experimentNameAutocorrect given actual experiment name",
-      { exit: 2 }
+      { exit: 2 },
     );
   }
 
@@ -129,7 +178,7 @@ export function experimentNameAutocorrect(malformed: string): string[] {
   // but this logic matches src/index.ts. I neither want to change something
   // with such potential impact nor to create divergent behavior.
   return Object.keys(ALL_EXPERIMENTS).filter(
-    (name) => leven(name, malformed) < malformed.length * 0.4
+    (name) => leven(name, malformed) < malformed.length * 0.4,
   );
 }
 
@@ -165,6 +214,24 @@ export function setEnabled(name: ExperimentName, to: boolean | null): void {
 }
 
 /**
+ * Enables multiple experiments given a comma-delimited environment variable:
+ * `FIREBASE_CLI_EXPERIMENTS`.
+ *
+ * Example:
+ * FIREBASE_CLI_PREVIEWS=experiment1,experiment2,turtle
+ *
+ * Would silently enable `experiment1` and `experiment2`, but would not enable `turtle`.
+ */
+export function enableExperimentsFromCliEnvVariable(): void {
+  const experiments = process.env.FIREBASE_CLI_EXPERIMENTS || "";
+  for (const experiment of experiments.split(",")) {
+    if (isValidExperiment(experiment)) {
+      setEnabled(experiment, true);
+    }
+  }
+}
+
+/**
  * Assert that an experiment is enabled before following a code path.
  * This code is unnecessary in code paths guarded by ifEnabled. When
  * a customer's project was clearly written against an experiment that
@@ -173,11 +240,28 @@ export function setEnabled(name: ExperimentName, to: boolean | null): void {
  */
 export function assertEnabled(name: ExperimentName, task: string): void {
   if (!isEnabled(name)) {
-    throw new FirebaseError(
-      `Cannot ${task} because the experiment ${bold(name)} is not enabled. To enable ${bold(
-        name
-      )} run ${bold(`firebase experiments:enable ${name}`)}`
-    );
+    const prefix = `Cannot ${task} because the experiment ${bold(name)} is not enabled.`;
+    if (isRunningInGithubAction()) {
+      const path = process.env.GITHUB_WORKFLOW_REF?.split("@")[0];
+      const filename = path ? `.github/workflows/${basename(path)}` : "your action's yml";
+      const newValue = [process.env.FIREBASE_CLI_EXPERIMENTS, name].filter((it) => !!it).join(",");
+      throw new FirebaseError(
+        `${prefix} To enable add a ${bold(
+          "FIREBASE_CLI_EXPERIMENTS",
+        )} environment variable to ${filename}, like so: ${italic(`
+
+- uses: FirebaseExtended/action-hosting-deploy@v0
+  with:
+    ...
+  env:
+    FIREBASE_CLI_EXPERIMENTS: ${newValue}
+`)}`,
+      );
+    } else {
+      throw new FirebaseError(
+        `${prefix} To enable ${bold(name)} run ${bold(`firebase experiments:enable ${name}`)}`,
+      );
+    }
   }
 }
 

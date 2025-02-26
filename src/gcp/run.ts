@@ -9,7 +9,7 @@ import { logger } from "../logger";
 const API_VERSION = "v1";
 
 const client = new Client({
-  urlPrefix: runOrigin,
+  urlPrefix: runOrigin(),
   auth: true,
   apiVersion: API_VERSION,
 });
@@ -68,7 +68,7 @@ export interface ServiceSpec {
 export interface ServiceStatus {
   observedGeneration: number;
   conditions: Condition[];
-  latestRevisionName: string;
+  latestReadyRevisionName: string;
   latestCreatedRevisionName: string;
   traffic: TrafficTarget[];
   url: string;
@@ -101,7 +101,7 @@ export interface RevisionSpec {
 }
 
 export interface RevisionTemplate {
-  metadata: ObjectMetadata;
+  metadata: Partial<ObjectMetadata>;
   spec: RevisionSpec;
 }
 
@@ -153,6 +153,7 @@ export async function getService(name: string): Promise<Service> {
   } catch (err: any) {
     throw new FirebaseError(`Failed to fetch Run service ${name}`, {
       original: err,
+      status: err?.context?.response?.statusCode,
     });
   }
 }
@@ -162,7 +163,6 @@ export async function getService(name: string): Promise<Service> {
  */
 export async function updateService(name: string, service: Service): Promise<Service> {
   delete service.status;
-  delete (service.spec.template.metadata as any).name;
   service = await exports.replaceService(name, service);
 
   // Now we need to wait for reconciliation or we might delete the docker
@@ -184,7 +184,7 @@ export function serviceIsResolved(service: Service): boolean {
     logger.debug(
       `Service ${service.metadata.name} is not resolved because` +
         `observed generation ${service.status?.observedGeneration} does not ` +
-        `match spec generation ${service.metadata.generation}`
+        `match spec generation ${service.metadata.generation}`,
     );
     return false;
   }
@@ -195,7 +195,7 @@ export function serviceIsResolved(service: Service): boolean {
   if (readyCondition?.status === "Unknown") {
     logger.debug(
       `Waiting for service ${service.metadata.name} to be ready. ` +
-        `Status is ${JSON.stringify(service.status?.conditions)}`
+        `Status is ${JSON.stringify(service.status?.conditions)}`,
     );
     return false;
   } else if (readyCondition?.status === "True") {
@@ -203,11 +203,11 @@ export function serviceIsResolved(service: Service): boolean {
   }
   logger.debug(
     `Service ${service.metadata.name} has unexpected ready status ${JSON.stringify(
-      readyCondition
-    )}. It may have failed rollout.`
+      readyCondition,
+    )}. It may have failed rollout.`,
   );
   throw new FirebaseError(
-    `Unexpected Status ${readyCondition?.status} for service ${service.metadata.name}`
+    `Unexpected Status ${readyCondition?.status} for service ${service.metadata.name}`,
   );
 }
 
@@ -221,6 +221,7 @@ export async function replaceService(name: string, service: Service): Promise<Se
   } catch (err: any) {
     throw new FirebaseError(`Failed to replace Run service ${name}`, {
       original: err,
+      status: err?.context?.response?.statusCode,
     });
   }
 }
@@ -233,7 +234,7 @@ export async function replaceService(name: string, service: Service): Promise<Se
 export async function setIamPolicy(
   name: string,
   policy: iam.Policy,
-  httpClient: Client = client
+  httpClient: Client = client,
 ): Promise<void> {
   // Cloud Run has an atypical REST binding for SetIamPolicy. Instead of making the body a policy and
   // the update mask a query parameter (e.g. Cloud Functions v1) the request body is the literal
@@ -250,6 +251,7 @@ export async function setIamPolicy(
   } catch (err: any) {
     throw new FirebaseError(`Failed to set the IAM Policy on the Service ${name}`, {
       original: err,
+      status: err?.context?.response?.statusCode,
     });
   }
 }
@@ -259,7 +261,7 @@ export async function setIamPolicy(
  */
 export async function getIamPolicy(
   serviceName: string,
-  httpClient: Client = client
+  httpClient: Client = client,
 ): Promise<IamPolicy> {
   try {
     const response = await httpClient.get<IamPolicy>(`${serviceName}:getIamPolicy`);
@@ -282,7 +284,7 @@ export async function setInvokerCreate(
   projectId: string,
   serviceName: string,
   invoker: string[],
-  httpClient: Client = client // for unit testing
+  httpClient: Client = client, // for unit testing
 ) {
   if (invoker.length === 0) {
     throw new FirebaseError("Invoker cannot be an empty array");
@@ -311,7 +313,7 @@ export async function setInvokerUpdate(
   projectId: string,
   serviceName: string,
   invoker: string[],
-  httpClient: Client = client // for unit testing
+  httpClient: Client = client, // for unit testing
 ) {
   if (invoker.length === 0) {
     throw new FirebaseError("Invoker cannot be an empty array");
@@ -320,7 +322,7 @@ export async function setInvokerUpdate(
   const invokerRole = "roles/run.invoker";
   const currentPolicy = await getIamPolicy(serviceName, httpClient);
   const currentInvokerBinding = currentPolicy.bindings?.find(
-    (binding) => binding.role === invokerRole
+    (binding) => binding.role === invokerRole,
   );
   if (
     currentInvokerBinding &&

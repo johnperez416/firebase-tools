@@ -1,11 +1,12 @@
+import * as clc from "colorette";
 import { logger } from "../logger";
 import { hostingOrigin } from "../api";
 import { bold, underline, white } from "colorette";
-import { has, includes, each } from "lodash";
+import { includes, each } from "lodash";
 import { needProjectId } from "../projectUtils";
 import { logBullet, logSuccess, consoleUrl, addSubdomain } from "../utils";
 import { FirebaseError } from "../error";
-import { track } from "../track";
+import { AnalyticsParams, trackGA4 } from "../track";
 import { lifecycleHooks } from "./lifecycleHooks";
 import * as experiments from "../experiments";
 import * as HostingTarget from "./hosting";
@@ -15,8 +16,16 @@ import * as FunctionsTarget from "./functions";
 import * as StorageTarget from "./storage";
 import * as RemoteConfigTarget from "./remoteconfig";
 import * as ExtensionsTarget from "./extensions";
+import * as DataConnectTarget from "./dataconnect";
+import { HostingConfig } from "../firebaseConfig";
 import { prepareFrameworks } from "../frameworks";
-import { HostingDeploy } from "./hosting/context";
+import { FrameworkContext } from "../frameworks/interfaces";
+import { addPinnedFunctionsToOnlyString, hasPinnedFunctions } from "./hosting/prepare";
+import { isRunningInGithubAction } from "../init/features/hosting/github";
+import { TARGET_PERMISSIONS } from "../commands/deploy";
+import { requirePermissions } from "../requirePermissions";
+import { Options } from "../options";
+import { Context } from "./hosting/context";
 
 const TARGETS = {
   hosting: HostingTarget,
@@ -26,13 +35,39 @@ const TARGETS = {
   storage: StorageTarget,
   remoteconfig: RemoteConfigTarget,
   extensions: ExtensionsTarget,
+  dataconnect: DataConnectTarget,
 };
+
+export type DeployOptions = Options & { dryRun?: boolean };
 
 type Chain = ((context: any, options: any, payload: any) => Promise<unknown>)[];
 
 const chain = async function (fns: Chain, context: any, options: any, payload: any): Promise<void> {
   for (const latest of fns) {
     await latest(context, options, payload);
+  }
+};
+
+export const matchesHostingTarget = (only: string | undefined, target?: string): boolean => {
+  if (!only) return true;
+  if (!only.includes("hosting:")) return true;
+  const targetStr = `hosting:${target ?? ""}`;
+  return only.split(",").some((t) => t === targetStr);
+};
+
+export const prepareFrameworksIfNeeded = async function (
+  targetNames: (keyof typeof TARGETS)[],
+  options: DeployOptions,
+  context: FrameworkContext,
+): Promise<void> {
+  const config = options.config.get("hosting") as HostingConfig;
+  if (
+    Array.isArray(config)
+      ? config.some((it) => it.source && matchesHostingTarget(options.only, it.target))
+      : config.source
+  ) {
+    experiments.assertEnabled("webframeworks", "deploy a web framework from source");
+    await prepareFrameworks("deploy", targetNames, context, options);
   }
 };
 
@@ -43,13 +78,13 @@ const chain = async function (fns: Chain, context: any, options: any, payload: a
  */
 export const deploy = async function (
   targetNames: (keyof typeof TARGETS)[],
-  options: any,
-  customContext = {}
+  options: DeployOptions,
+  customContext = {},
 ) {
   const projectId = needProjectId(options);
   const payload = {};
   // a shared context object for deploy targets to decorate as needed
-  const context: any = Object.assign({ projectId }, customContext);
+  const context: Context = Object.assign({ projectId }, customContext);
   const predeploys: Chain = [];
   const prepares: Chain = [];
   const deploys: Chain = [];
@@ -58,11 +93,30 @@ export const deploy = async function (
   const startTime = Date.now();
 
   if (targetNames.includes("hosting")) {
-    const config = options.config.get("hosting");
-    if (Array.isArray(config) ? config.some((it) => it.source) : config.source) {
-      experiments.assertEnabled("webframeworks", "deploy a web framework to hosting");
-      await prepareFrameworks(targetNames, context, options);
+    await prepareFrameworksIfNeeded(targetNames, options, context);
+  }
+
+  if (targetNames.includes("hosting") && hasPinnedFunctions(options)) {
+    experiments.assertEnabled("pintags", "deploy a tagged function as a hosting rewrite");
+    if (!targetNames.includes("functions")) {
+      targetNames.unshift("functions");
+      try {
+        await requirePermissions(options, TARGET_PERMISSIONS["functions"]);
+      } catch (e) {
+        if (isRunningInGithubAction()) {
+          throw new FirebaseError(
+            "It looks like you are deploying a Hosting site along with Cloud Functions " +
+              "using a GitHub action version that did not include Cloud Functions " +
+              "permissions. Please reinstall the GitHub action with" +
+              clc.bold("firebase init hosting:github"),
+            { original: e as Error },
+          );
+        } else {
+          throw e;
+        }
+      }
     }
+    await addPinnedFunctionsToOnlyString(context, options);
   }
 
   for (const targetName of targetNames) {
@@ -74,9 +128,11 @@ export const deploy = async function (
 
     predeploys.push(lifecycleHooks(targetName, "predeploy"));
     prepares.push(target.prepare);
-    deploys.push(target.deploy);
-    releases.push(target.release);
-    postdeploys.push(lifecycleHooks(targetName, "postdeploy"));
+    if (!options.dryRun) {
+      deploys.push(target.deploy);
+      releases.push(target.release);
+      postdeploys.push(lifecycleHooks(targetName, "postdeploy"));
+    }
   }
 
   logger.info();
@@ -91,25 +147,33 @@ export const deploy = async function (
   await chain(releases, context, options, payload);
   await chain(postdeploys, context, options, payload);
 
-  if (has(options, "config.notes.databaseRules")) {
-    await track("Rules Deploy", options.config.notes.databaseRules);
-  }
-
   const duration = Date.now() - startTime;
-  await track("Product Deploy", [...targetNames].sort().join(","), duration);
+  const analyticsParams: AnalyticsParams = {
+    interactive: options.nonInteractive ? "false" : "true",
+  };
 
+  Object.keys(TARGETS).reduce((accum, t) => {
+    accum[t] = "false";
+    return accum;
+  }, analyticsParams);
+  for (const t of targetNames) {
+    analyticsParams[t] = "true";
+  }
+  await trackGA4("product_deploy", analyticsParams, duration);
+
+  const successMessage = options.dryRun ? "Dry run complete!" : "Deploy complete!";
   logger.info();
-  logSuccess(bold(underline("Deploy complete!")));
+  logSuccess(bold(underline(successMessage)));
   logger.info();
 
   const deployedHosting = includes(targetNames, "hosting");
-  logger.info(bold("Project Console:"), consoleUrl(options.project, "/overview"));
+  logger.info(bold("Project Console:"), consoleUrl(options.project ?? "_", "/overview"));
   if (deployedHosting) {
-    each(context.hosting.deploys as HostingDeploy[], (deploy) => {
-      logger.info(bold("Hosting URL:"), addSubdomain(hostingOrigin, deploy.config.site));
+    each(context.hosting?.deploys, (deploy) => {
+      logger.info(bold("Hosting URL:"), addSubdomain(hostingOrigin(), deploy.config.site));
     });
-    const versionNames = context.hosting.deploys.map((deploy: any) => deploy.version);
-    return { hosting: versionNames.length === 1 ? versionNames[0] : versionNames };
+    const versionNames = context.hosting?.deploys.map((deploy: any) => deploy.version);
+    return { hosting: versionNames?.length === 1 ? versionNames[0] : versionNames };
   } else {
     return { hosting: undefined };
   }
